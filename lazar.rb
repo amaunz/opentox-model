@@ -54,6 +54,7 @@ class Lazar < Model
 					sims << OpenTox::Utils.gauss(sim)
 					#TODO check for 0 s
 					acts << Math.log10(act.to_f)
+					#acts << act.to_f
 					neighbor_matches[i] = matches
 					i+=1
 				end
@@ -238,6 +239,56 @@ class Lazar < Model
 		owl.rdf
 	end
 
+  def majority_vote(confs)
+    p=0.0
+    confs.each do |v|
+      p += v
+    end
+    p=p/confs.size
+  end
+
+  def consensus_prediction(lazar, model_uris, prediction, compound_uri, dependent_variable)
+      model_uris.each do |uri|
+        my_model = Lazar.get(uri.split('/').last)
+        my_prediction = OpenTox::Dataset.new
+      	my_prediction.creator = my_model.uri
+        feature_uri = YAML.load(my_model.yaml).dependentVariables
+        prediction.features << feature_uri 
+        my_prediction.title = URI.decode(feature_uri.split(/#/).last) 
+        if cached_prediction = Prediction.first(:model_uri => my_model.uri, :compound_uri => compound_uri)
+          my_prediction = YAML.load(cached_prediction.yaml)
+        else
+          my_model.classification(compound_uri, my_prediction, true)
+          Prediction.create(:model_uri => my_model.uri, :compound_uri => compound_uri, :yaml => my_prediction.to_yaml)
+        end
+      end
+
+      prediction.compounds << compound_uri
+      @confs = []
+      model_uris.each do |uri|
+        my_model = Lazar.get(uri.split('/').last)
+        my_prediction = Prediction.first(:model_uri => my_model.uri, :compound_uri => compound_uri).yaml
+        feature_uri = YAML.load(my_model.yaml).dependentVariables
+        pred = YAML.load(my_prediction).data[compound_uri][0][feature_uri]
+        confidence = pred[File.join(@@config[:services]["opentox-model"],"lazar#confidence")]
+        classification = pred[File.join(@@config[:services]["opentox-model"],"lazar#classification")]
+        @confs << confidence
+      end
+
+      prediction.features.uniq!
+      classification = false
+      confidence = lazar.majority_vote(@confs)
+      if confidence > 0.0 
+        classification = true
+      end
+      tuple = {
+        File.join(@@config[:services]["opentox-model"],"lazar#classification") => classification , 
+        File.join(@@config[:services]["opentox-model"],"lazar#confidence") => confidence, 
+        
+      }
+      prediction.data[compound_uri] = [ {dependent_variable => tuple} ]
+  end
+
 end
 
 get '/:id/?' do
@@ -312,42 +363,70 @@ post '/:id/?' do # create prediction
 		prediction_type = "regression"
 	end
 
+
+  model_uris = YAML.load(lazar.yaml).models
+
+  # single prediction
 	if compound_uri
-    # look for cached prediction first
-    if cached_prediction = Prediction.first(:model_uri => lazar.uri, :compound_uri => compound_uri)
-      @prediction = YAML.load(cached_prediction.yaml)
+
+    # AM: got normal model
+    if model_uris.size == 0 
+
+      if cached_prediction = Prediction.first(:model_uri => lazar.uri, :compound_uri => compound_uri)
+        @prediction = YAML.load(cached_prediction.yaml)
+      else
+        begin
+          eval "lazar.#{prediction_type}(compound_uri,@prediction,true) unless lazar.database_activity?(compound_uri,@prediction)"
+          Prediction.create(:model_uri => lazar.uri, :compound_uri => compound_uri, :yaml => @prediction.to_yaml)
+        rescue
+          LOGGER.error "#{prediction_type} failed for #{compound_uri} with #{$!} "
+          halt 500, "Prediction of #{compound_uri} failed."
+        end
+      end
+      
+    # AM: got balanced submodels; do consensus prediction (classification only)
     else
-      begin
-        # AM: switch here between regression and classification
-        eval "lazar.#{prediction_type}(compound_uri,@prediction,true) unless lazar.database_activity?(compound_uri,@prediction)"
-        Prediction.create(:model_uri => lazar.uri, :compound_uri => compound_uri, :yaml => @prediction.to_yaml)
-      rescue
-        LOGGER.error "#{prediction_type} failed for #{compound_uri} with #{$!} "
-        halt 500, "Prediction of #{compound_uri} failed."
+      if prediction_type == "classification"
+        begin
+          lazar.consensus_prediction(lazar, model_uris, @prediction, compound_uri, dependent_variable)
+          @prediction.data[File.join(@@config[:services]["opentox-model"],"lazar#models")] = model_uris
+        rescue
+          LOGGER.error "#{prediction_type} failed for #{compound_uri} with #{$!} "
+          halt 500, "Prediction of #{compound_uri} failed."
+        end
       end
     end
-		case request.env['HTTP_ACCEPT']
-		when /yaml/ 
-			@prediction.to_yaml
-		when 'application/rdf+xml'
-			@prediction.to_owl
+
+    case request.env['HTTP_ACCEPT']
+    when /yaml/ 
+      return @prediction.to_yaml
+    when 'application/rdf+xml'
+      return @prediction.to_owl
     else
       halt 400, "MIME type \"#{request.env['HTTP_ACCEPT']}\" not supported." 
-		end
+    end
 
+
+
+  # set-prediction
 	elsif dataset_uri
     response['Content-Type'] = 'text/uri-list'
-		task_uri = OpenTox::Task.as_task("Predict dataset",url_for("/#{lazar.id}", :full)) do
+		task_uri = OpenTox::Task.as_task do
 			input_dataset = OpenTox::Dataset.find(dataset_uri)
 			input_dataset.compounds.each do |compound_uri|
-				# AM: switch here between regression and classification
-				begin
-					eval "lazar.#{prediction_type}(compound_uri,@prediction) unless lazar.database_activity?(compound_uri,@prediction)"
-				rescue
-					LOGGER.error "#{prediction_type} failed for #{compound_uri} with #{$!} "
-				end
+        begin
+          if model_uris.size == 0 
+            eval "lazar.#{prediction_type}(compound_uri,@prediction) unless lazar.database_activity?(compound_uri,@prediction)"
+          else
+            lazar.consensus_prediction(lazar, model_uris, @prediction, compound_uri, dependent_variable)
+          end
+        rescue
+          LOGGER.error "#{prediction_type} failed for #{compound_uri} with #{$!} "
+        end
 			end
 			begin
+        @prediction.features.uniq!
+        @prediction.data[File.join(@@config[:services]["opentox-model"],"lazar#models")] = model_uris
 				uri = @prediction.save.chomp
 			rescue
 				halt 500, "Could not save prediction dataset"
